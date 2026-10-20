@@ -299,7 +299,6 @@ _GLORIOUS_MODELS = (
     (0x258A, "Glorious Model D Wireless",    (0x2011, 0x2023)),
     (0x258A, "Glorious Model D- Wireless",   (0x2025,)),
     (0x258A, "Glorious Model D 2 PRO",       (0x2036, 0x2034, 0x201A)),
-    (0x22D4, "Glorious Model I",             (0x1503,)),
     (0x093A, "Glorious Model I 2 Wireless",  (0x821A, 0x821D)),
     (0x3794, "Glorious Model O3 Wireless",   (0xA300, 0xA312)),
 )
