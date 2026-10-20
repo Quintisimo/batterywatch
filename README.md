@@ -28,14 +28,16 @@
 | Provider | What it covers |
 |----------|----------------|
 | **UPower** | Bluetooth and wireless peripherals reported by the system - headphones, mice, keyboards, game controllers, and more |
+| **BlueZ** | Fallback for Bluetooth devices that don't publish battery to UPower (e.g. 8bitdo controllers) |
 | **OpenLinkHub** | Corsair and other devices managed by [OpenLinkHub](https://github.com/jurkovic-nikola/OpenLinkHub) |
 | **OpenRazer** | Razer peripherals via [OpenRazer](https://openrazer.github.io/) |
 | **KDE Connect** | Battery levels of paired KDE Connect devices (phones, tablets, etc), with easy unpair action |
-| **HID Devices** | Peripherals read directly via Linux HID (currently supports Steam Controller 2, Keychron M5, ROG Azoth, Glorious wireless mice, and Logitech G533/G535/G Pro/G733/G933/G935 headsets) |
+| **HID Devices** | Peripherals read directly via Linux HID (currently supports Steam Controller 2, Keychron M5, ROG Azoth, Razer Barracuda X Chroma, and Glorious wireless mice) |
+| **Solaar** (experimental) | Logitech HID++ peripherals via [Solaar](https://github.com/pwr-Solaar/Solaar) - only tested on a few devices, so feedback is welcome |
+| **HeadsetControl** | Compatible wireless headsets supported by [HeadsetControl](https://github.com/Sapd/HeadsetControl), with battery levels obtained through its command-line JSON output. Requires HeadsetControl to be installed and the headset to be supported by it. |
 
 > **Note:** The Glorious mouse protocol (vendor feature report `02 02 ... 83`, PID list) is taken from the `glorious-mouse` reference implementation; it reports charge level only, so Glorious mice are never shown as charging. Not verified on real hardware.
 
-> **Note:** Protocol details (commands, PIDs, and battery calibration curves) for the Logitech headsets are sourced from [HeadsetControl](https://github.com/Sapd/HeadsetControl) (GPL-3.0) and [Solaar](https://github.com/pwr-Solaar-Solaar), with attribution in `contents/bin/read_hid_devices`. None of the models has been verified on real hardware yet: support for G533, G535, G733, G933, G935 and G PRO X follows Solaar's device data, while G733 v3, G PRO and G PRO X v0 are protocol-shared extrapolations.
 
 ## Installation
 
@@ -90,13 +92,14 @@ For instructions on how to contribute translations, add new languages, or test c
 ## Supported Languages
 
 <!-- TRANSLATIONS_START -->
-| Locale | Language | Status         | % Done |
-|--------|----------|----------------|--------|
-| cs     | Czech        | 🟡 In Progress |    93% |
-| de     | German       | ✅ Complete    |   100% |
-| he     | Hebrew       | 🟡 In Progress |    93% |
-| hu     | Hungarian    | 🟡 In Progress |    93% |
-| nl     | Dutch        | 🟡 In Progress |    93% |
-| pl     | polish       | 🟡 In Progress |    93% |
-| ru     | Russian      | 🟡 In Progress |    93% |
+| Locale | Language | Status | % Done |
+|--------|----------|--------|--------|
+| en     | English      | ✅ Source   |   100% |
+| cs     | Czech        | ✅ Complete |   100% |
+| de     | German       | ✅ Complete |   100% |
+| he     | Hebrew       | ✅ Complete |   100% |
+| hu     | Hungarian    | ✅ Complete |   100% |
+| nl     | Dutch        | ✅ Complete |   100% |
+| pl     | Polish       | ✅ Complete |   100% |
+| ru     | Russian      | ✅ Complete |   100% |
 <!-- TRANSLATIONS_END -->

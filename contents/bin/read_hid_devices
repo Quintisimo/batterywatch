@@ -32,6 +32,20 @@ TIMEOUT_SEC = 10
 MAX_DEVICES = 8
 HID_BUFFER_SIZE = 64
 
+# Diagnostic logging. With --debug, helper emits stderr lines (never interfering
+# with the JSON on stdout) so a found-but-silent device is visible instead of
+# silently vanishing - the widget has no third state between "blocked" and
+# "readable" for a device that won't answer.
+_DEBUG = "--debug" in sys.argv
+
+def debug(message):
+    if _DEBUG:
+        print(f"[batterywatch] {message}", file=sys.stderr)
+
+def hexbuf(buf):
+    """Space-separated lowercase hex, the packet notation used in --debug output."""
+    return " ".join(f"{b:02x}" for b in buf)
+
 # Request-response devices (e.g. Keychron M5) reply within milliseconds; don't
 # stall the widget for the full stream timeout, especially when the mouse sleeps.
 REQUEST_TIMEOUT_SEC = 1
@@ -49,12 +63,13 @@ class DeviceType(Enum):
     HEADSET     = "audio-headset"
 
 # usage_page sentinel: any vendor-defined page (0xff00-0xffff). Used when the
-# battery collection's exact page varies across a family (e.g. Glorious mice).
+# battery collection's exact page varies across a family, so only the range is
+# stable enough to match on.
 VENDOR_USAGE_PAGE = "vendor"
 
 class DeviceVariant(NamedTuple):
-    pid:         int         # Product ID
-    iface:       int | None  # Interface
+    pid:         int              # Product ID
+    iface:       int | None       # Interface
     usage_page:  int | str | None = None  # Report-descriptor usage page of the battery node, or VENDOR_USAGE_PAGE
     source:      InputStreamSchema | RequestSchema | FeatureReportSchema | None = None  # Optional schema overriding the device default
 
@@ -73,29 +88,56 @@ class InputStreamSchema(NamedTuple):
     charge_range: tuple[int, int] | None          # Battery charge min, max; None = battery is already reported in %
     status:       DataPos | ChargingStates | None # Charging: direct byte (DataPos), derived from state ID (ChargingStates), or unsupported (None)
 
-    def valid(self, buf) -> bool:
-        return True
+    def rejection_reason(self, buf) -> str | None:
+        # Nothing to match against: a stream has no request to answer
+        return None
 
     def poll_timeout(self) -> float:
         return TIMEOUT_SEC
+
+# One step in an ordered RequestSchema exchange.  The generic executor knows
+# only the semantic key and report ID; protocol-specific correlation belongs
+# in validate_reply (for example, Razer's echoed property byte).
+class RequestTransaction(NamedTuple):
+    key:            str
+    request:        bytes
+    report_id:      int
+    validate_reply: Callable[[bytes], str | None]
+
+    def rejection_reason(self, buf) -> str | None:
+        if not buf:
+            return "empty packet"
+        if buf[0] != self.report_id:
+            return f"report id {buf[0]:#04x} is not {self.report_id:#04x}"
+        return self.validate_reply(buf)
 
 # Device responds to a request packet with a battery report (e.g. Keychron M5)
 class RequestSchema(NamedTuple):
     charge:       DataPos
     charge_range: tuple[int, int] | None
     status:       DataPos | ChargingStates | None
-    request:      bytes                           # Packet to send before reading; device replies with battery report
+    request:      bytes = b""                     # Single request packet; unused when transactions is set
     timeout:      float = REQUEST_TIMEOUT_SEC     # Max wait for the reply; devices answer in milliseconds
     reply_prefix: bytes | None = None             # Expected reply prefix; None keeps the common report-ID + command echo check
+    # Optional ordered exchanges. Empty preserves the legacy one-request path.
+    transactions: tuple[RequestTransaction, ...] = ()
 
-    def valid(self, buf) -> bool:
+    def rejection_reason(self, buf) -> str | None:
+        if len(buf) < 2:
+            return f"{len(buf)}-byte packet is too short to be a reply"
+        if self.reply_prefix is not None:
+            if len(buf) < len(self.reply_prefix) or buf[:len(self.reply_prefix)] != self.reply_prefix:
+                return f"expected prefix {hexbuf(self.reply_prefix)}, got {hexbuf(buf)}"
+            return None
+        if len(self.request) < 2:
+            return None
         # A real battery reply echoes the request's command byte, which tells it
         # apart from unrelated reports on the same interface.
-        if self.reply_prefix is not None:
-            return len(buf) >= len(self.reply_prefix) and buf[:len(self.reply_prefix)] == self.reply_prefix
-        if len(self.request) < 2:
-            return True
-        return buf[0] == self.charge.report_id and buf[1] == self.request[1]
+        if buf[0] != self.charge.report_id:
+            return f"report id {buf[0]:#04x} is not {self.charge.report_id:#04x}"
+        if buf[1] != self.request[1]:
+            return f"device address {buf[1]:#04x} does not echo the requested {self.request[1]:#04x}"
+        return None
 
     def poll_timeout(self) -> float:
         return self.timeout
@@ -151,20 +193,6 @@ def interpret(schema, buffers):
     return {"percentage": percentage, "charging": charging}
 
 
-# Voltage (mV) -> percentage, linear interpolation over a sorted-by-percentage
-# curve of (percent, millivolt) breakpoints (descending mV). Used by the
-# Logitech HID++ headset family, which reports only a raw battery voltage.
-def _voltage_percentage(voltage_mv, curve):
-    for (hi_pct, hi_mv), (lo_pct, lo_mv) in zip(curve, curve[1:]):
-        if voltage_mv >= hi_mv:
-            return hi_pct
-        if voltage_mv >= lo_mv:
-            span = hi_mv - lo_mv
-            fraction = (voltage_mv - lo_mv) / span if span > 0 else 0
-            return round(lo_pct + (hi_pct - lo_pct) * fraction)
-    return curve[-1][0]
-
-
 # ══════════════════════════════════════════════════════════════════════════
 # devices - the registry of known/supported devices (pure data)
 # ══════════════════════════════════════════════════════════════════════════
@@ -180,65 +208,9 @@ class Device(NamedTuple):
 # iface = None means that any interface contains battery data
 
 
-# ── Logitech headset battery voltage protocol ───────────────────────────────
-# Logitech headsets report a raw battery voltage over HID++: write a 20-byte
-# long message, read a 7-byte short reply on report 0x10 (byte 1 echoes the
-# request's 0xff device byte); only the feature command + mV->% curve differ.
-# Commands, PIDs and curves from headsetcontrol (GPL-3.0): logitech_g533.hpp,
-# logitech_g535.hpp, logitech_gpro.hpp, logitech_g633_g933_935.hpp +
-# protocols/logitech_calibrations.hpp. Battery node = report-descriptor usage
-# page 0xff43 (G535: consumer page 0x0c, so it pins interface 3).
-# Status (third-party sources only - unfortunately, I don't have the real hardware to
-# verify these myself): G733 0x0AB5/0x0AFE, G533, G535, G933, G935 and
-# G PRO X follow from Solaar captures/device lists; G733 v3 0x0B1F,
-# G PRO 0x0AA7 and G PRO X v0 0x0AAA are protocol-shared extrapolations.
-# G PRO X 2 excluded: Solaar lists it as 0x0AF7 on the "Centurion transport",
-# a different protocol family.
-G633_CURVE = ((100, 4100), (80, 3950), (60, 3850), (40, 3750), (20, 3650), (10, 3500), (5, 3300), (0, 3150))
-G533_CURVE = ((100, 4200), (50, 3850), (30, 3790), (20, 3750), (5, 3680), (0, 3330))
-G535_CURVE = ((100, 4175), (50, 3817), (30, 3766), (20, 3730), (5, 3664), (0, 3310))
-GPRO_CURVE = ((100, 4150), (50, 3830), (30, 3780), (20, 3740), (5, 3670), (0, 3320))
-
 # parse() result: plausible-looking but not a valid battery frame (e.g. an
 # unrelated report on the same interface) - discard and keep waiting.
 KEEP_READING = object()
-
-
-def _logitech_voltage_parse(curve):
-    # 0x10 reply: [0]=0x10, [1]=0xff (echo of the request's device byte),
-    # [2]=status (0xff = device off), [3]=reserved, [4..5]=voltage big-endian,
-    # [6]=charge state (0x01 discharging, 0x03 charging) - same semantics as
-    # the flags byte of the G733's HID++ ADC battery feature in Solaar captures.
-    def parse(buffers):
-        buf = buffers[0x10]
-        if buf[2] == 0xFF:
-            return None  # device off / not sending - definitive answer
-        voltage_mv = (buf[4] << 8) | buf[5]
-        if voltage_mv < curve[-1][1]:
-            return KEEP_READING  # below the lowest calibrated voltage: not the battery frame
-        if voltage_mv > 4600:
-            return KEEP_READING  # implausibly high for a single-cell Li-ion: not the battery frame
-        return {"percentage": _voltage_percentage(voltage_mv, curve),
-                "charging": buf[6] == 0x03}
-    return parse
-
-
-def _logitech_headset(name, cmd, curve, *pids, usage_page=0xFF43, iface=None):
-    """A single Logitech headset; returns the ready-made Device."""
-    return Device(
-        name=name,
-        device_type=DeviceType.HEADSET,
-        vid=0x046D,
-        variants=tuple(DeviceVariant(pid, iface, usage_page) for pid in pids),
-        source=RequestSchema(
-            charge=DataPos(0x10, 4),
-            charge_range=None,
-            status=ChargingStates(pos=DataPos(0x10, 6), states={0x01: False, 0x03: True}),
-            request=bytes([0x11, 0xFF, cmd[0], cmd[1]]) + b"\x00" * 16,
-            timeout=REQUEST_TIMEOUT_SEC,
-        ),
-        parse=_logitech_voltage_parse(curve),
-    )
 
 
 def _azoth_serial_resolver(path, vid, pid, fields):
@@ -247,6 +219,55 @@ def _azoth_serial_resolver(path, vid, pid, fields):
             or printable_serial(fields.get("HID_UNIQ", ""))
             or "unknown-hid")
 
+
+# ── Razer Barracuda X Chroma property protocol ────────────────────────────
+RAZER_REPORT_ID = 0x02
+RAZER_REPORT_LEN = 64
+RAZER_VALUE_BYTE = 13
+
+# Captures verify the checksum asymmetry: host requests XOR bytes 0..61,
+# including the report ID; device replies XOR bytes 1..61, excluding it.
+def _razer_get_request(prop):
+    request = bytearray(RAZER_REPORT_LEN)
+    request[:11] = bytes.fromhex("02 00 60 00 00 00 04 00 00 80") + bytes([prop])
+    checksum = 0
+    for byte in request[:62]:
+        checksum ^= byte
+    request[62] = checksum
+    return bytes(request)
+
+def _razer_reply_check(prop):
+    expected = bytes.fromhex("02 02 60 00 00 00 05 00 80 80") + bytes([prop, 0x01, 0x01])
+
+    def check(buf):
+        if len(buf) != RAZER_REPORT_LEN:
+            return f"expected {RAZER_REPORT_LEN}-byte Razer reply, got {len(buf)} bytes"
+        if buf[:13] != expected:
+            return (f"expected Razer property reply {hexbuf(expected)}, "
+                    f"got {hexbuf(buf[:13])}")
+
+        checksum = 0
+        for byte in buf[1:62]:
+            checksum ^= byte
+        if buf[62] != checksum:
+            return f"Razer reply checksum {buf[62]:#04x} is not expected {checksum:#04x}"
+
+        value = buf[RAZER_VALUE_BYTE]
+        if prop == 0x21 and value > 100:
+            return f"Razer battery value {value} is outside 0..100"
+        if prop == 0x2A and value not in (0, 1):
+            return f"Razer charging value {value} is not 0 or 1"
+        return None
+    return check
+
+def _razer_parse(replies):
+    return {
+        "percentage": replies["battery"][RAZER_VALUE_BYTE],
+        "charging": replies["charging"][RAZER_VALUE_BYTE] == 0x01,
+    }
+
+RAZER_BATTERY_REQUEST = _razer_get_request(0x21)
+RAZER_CHARGING_REQUEST = _razer_get_request(0x2A)
 
 # ── Glorious wireless mice ─────────────────────────────────────────────────
 # Protocol per the glorious-mouse reference implementation: SET a 65-byte
@@ -415,15 +436,40 @@ KNOWN_DEVICES = [
         parse=None,
         serial_resolver=_azoth_serial_resolver,
     ),
-    # ── Logitech headsets ──────────────────────────────────────────────────
-    _logitech_headset("Logitech G733/G933/G935", (0x08, 0x0A), G633_CURVE, 0x0A5B, 0x0A87, 0x0AB5, 0x0AFE, 0x0B1F),
-    _logitech_headset("Logitech G533", (0x07, 0x01), G533_CURVE, 0x0A66),
-    _logitech_headset("Logitech G535", (0x05, 0x0D), G535_CURVE, 0x0AC4, usage_page=None, iface=3),
-    _logitech_headset("Logitech G PRO Series", (0x06, 0x0D), GPRO_CURVE, 0x0AA7, 0x0AAA, 0x0ABA),
+    Device(
+        name="Razer Barracuda X Chroma",
+        device_type=DeviceType.HEADSET,
+        vid=0x1532,
+        variants=(DeviceVariant(0x0574, None, 0xFF14),),
+        source=RequestSchema(
+            charge=DataPos(RAZER_REPORT_ID, RAZER_VALUE_BYTE),
+            charge_range=None,
+            status=None,
+            timeout=REQUEST_TIMEOUT_SEC,
+            transactions=(
+                RequestTransaction(
+                    key="battery",
+                    request=RAZER_BATTERY_REQUEST,
+                    report_id=RAZER_REPORT_ID,
+                    validate_reply=_razer_reply_check(0x21),
+                ),
+                RequestTransaction(
+                    key="charging",
+                    request=RAZER_CHARGING_REQUEST,
+                    report_id=RAZER_REPORT_ID,
+                    validate_reply=_razer_reply_check(0x2A),
+                ),
+            ),
+        ),
+        parse=_razer_parse,
+    ),
 ] + _glorious_mice()
 
-# PIDs whose variants select the battery node by report-descriptor usage page
+# PIDs whose variants select the battery node by report-descriptor usage page.
+# Descriptors are only read for these: doing it for every hidraw node would
+# mean opening a file per interface on every poll.
 _USAGE_PAGE_PIDS = {variant.pid for dev in KNOWN_DEVICES for variant in dev.variants if variant.usage_page is not None}
+
 
 class FoundDevice(NamedTuple):
     devpath: str
@@ -448,6 +494,10 @@ def printable_serial(value):
             value = value[:index]
             break
     return value or None
+
+def meaningful_hid_uniq(value):
+    """Reject missing and all-zero HID unique ids without changing other values."""
+    return value if value and any(char != "0" for char in value) else None
 
 # Returns the USB device serial for this HID node when its parent exposes one.
 # Some devices append malformed bytes to their string descriptor, so retain
@@ -501,9 +551,12 @@ def parse_uevent(path):
     return vid, pid, iface, fields, phys
 
 # Walks a raw HID report descriptor for its usage pages. Item byte: bits 0-1
-# size (0/1/2/4), bits 2-3 type, bits 4-7 tag. Usage Page = Global/tag 0,
-# Usage = Local/tag 0; 1-byte usages inherit the current page, 2-byte usages
-# carry their own in the high byte.
+# size (0/1/2/4), bits 2-3 type (0 Main, 1 Global, 2 Local), bits 4-7 tag.
+# Usage Page = Global/tag 0, Usage = Local/tag 0. A Usage item is a usage ID
+# *within* the current Usage Page, so a 2-byte usage is still that page - not a
+# page number in its high byte. Collection boundaries are not tracked: the
+# result is a flat set of every page the node declares, which is all the page
+# test in match_device() needs.
 def _parse_usage_pages(data):
     pages = set()
     page = 0
@@ -527,8 +580,7 @@ def _parse_usage_pages(data):
             page = int.from_bytes(value, "little")
             pages.add(page)
         elif btype == 2 and btag == 0:  # Local / Usage
-            usage = int.from_bytes(value, "little")
-            pages.add(page if item_len < 2 else usage >> 8)
+            pages.add(page)
     return pages
 
 # Usage pages declared by the hidraw node's report descriptor; empty on failure
@@ -563,11 +615,13 @@ def match_device(vid, pid, iface, usage_pages=None):
         for variant in dev.variants:
             if pid != variant.pid:
                 continue
-            # usage_page variants select the node by its report-descriptor page
+            # usage_page variants select the node by its report-descriptor page.
+            # Only reached once vid/pid already matched a registered variant, so
+            # a vendor-page match can never claim an unrelated device.
             if variant.usage_page is not None:
                 if not usage_pages:
                     continue
-                if variant.usage_page is VENDOR_USAGE_PAGE:
+                if variant.usage_page == VENDOR_USAGE_PAGE:
                     # Exact vendor page differs per model, so match the range
                     if any(page >= 0xFF00 for page in usage_pages):
                         return dev, variant
@@ -658,12 +712,18 @@ def find_devices():
         usage_pages = hid_usage_pages(f"/sys/class/hidraw/{name}/device/report_descriptor") if pid in _USAGE_PAGE_PIDS else set()
         matched = match_device(vid, pid, iface, usage_pages)
         if matched is None:
+            if pid in _USAGE_PAGE_PIDS:
+                # The usage page is what selects the battery node among a
+                # device's interfaces, so a miss here is worth explaining
+                debug(f"{name}: {vid:04x}:{pid:04x} (iface {iface}) has usage pages "
+                      f"{sorted(hex(p) for p in usage_pages) or 'none'}, "
+                      f"none matching a known battery node")
             continue
         desc, variant = matched
 
         serial = (desc.serial_resolver(f"/sys/class/hidraw/{name}/device/uevent", vid, pid, fields)
                   if desc.serial_resolver is not None
-                  else fields.get("HID_UNIQ", "") or "unknown-hid")
+                  else meaningful_hid_uniq(fields.get("HID_UNIQ", "")) or "unknown-hid")
 
         # phys is shared across a device's interfaces, so it identifies the
         # physical device; the best-ranked of its matching nodes wins.
@@ -679,7 +739,10 @@ def find_devices():
         if serial == "unknown-hid":
             serial = phys or name
 
-        best[key] = (rank, FoundDevice(f"/dev/{name}", serial, desc, pid, variant.source or desc.source))
+        devpath = f"/dev/{name}"
+        debug(f"{devpath}: reading {desc.name} {vid:04x}:{pid:04x} "
+              f"(iface {iface}, usage pages {[hex(p) for p in sorted(usage_pages)] or 'not read'})")
+        best[key] = (rank, FoundDevice(devpath, serial, desc, pid, variant.source or desc.source))
     return [best[key][1] for key in order[:MAX_DEVICES]]
 
 # True when the device is present but its hidraw node can't be opened for the
@@ -702,13 +765,17 @@ def open_device(dev, schema):
     flags = os.O_RDWR if write else os.O_RDONLY
     try:
         fd = os.open(dev.devpath, flags | os.O_NONBLOCK)
-    except OSError:
+    except OSError as e:
+        debug(f"{dev.desc.name}: open({dev.devpath}, "
+              f"{'O_RDWR' if write else 'O_RDONLY'}) failed: {e}")
         return None
 
-    if write:
+    if write and not schema.transactions:
         try:
+            debug(f"{dev.desc.name}: write {hexbuf(schema.request)} ({len(schema.request)} bytes)")
             os.write(fd, schema.request)
-        except OSError:
+        except OSError as e:
+            debug(f"{dev.desc.name}: write of {hexbuf(schema.request)} failed: {e}")
             os.close(fd)
             return None
 
@@ -744,11 +811,89 @@ def read_feature_status(dev, schema):
     buffers = {buf[0]: bytes(buf)}
     return dev.desc.parse(buffers) if dev.desc.parse is not None else interpret(schema, buffers)
 
-# Reads a device's power status: waits for the report(s) the schema needs or for
+# Runs a short ordered sequence of request/reply exchanges on one open node.
+# Every step must succeed before parse() sees any replies, so callers never get
+# a partial battery state.
+def read_transaction_status_hw(dev, schema):
+    fd = open_device(dev, schema)
+    if fd is None:
+        return None
+
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        replies = {}
+
+        for transaction in schema.transactions:
+            try:
+                debug(f"{dev.desc.name}: write {hexbuf(transaction.request)} "
+                      f"({len(transaction.request)} bytes) [{transaction.key}]")
+                written = os.write(fd, transaction.request)
+            except OSError as e:
+                debug(f"{dev.desc.name}: write of {hexbuf(transaction.request)} failed: {e}")
+                return None
+            if written != len(transaction.request):
+                debug(f"{dev.desc.name}: short write for {transaction.key}: "
+                      f"{written} of {len(transaction.request)} bytes")
+                return None
+
+            # Timeout applies per transaction; a full sequence may take N * timeout.
+            deadline = time.monotonic() + schema.poll_timeout()
+            read_size = max(HID_BUFFER_SIZE, len(transaction.request))
+            while True:
+                timeout_ms = int((deadline - time.monotonic()) * 1000)
+                if timeout_ms <= 0:
+                    debug(f"{dev.desc.name}: no accepted reply for {transaction.key} "
+                          f"within {schema.poll_timeout():g}s ({dev.devpath})")
+                    return None
+
+                events = poller.poll(timeout_ms)
+                if not events:
+                    debug(f"{dev.desc.name}: no accepted reply for {transaction.key} "
+                          f"within {schema.poll_timeout():g}s ({dev.devpath})")
+                    return None
+
+                _, revents = events[0]
+                if revents & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                    debug(f"{dev.desc.name}: device error or disconnect "
+                          f"(poll flags {revents:#x})")
+                    return None
+                if not (revents & select.POLLIN):
+                    return None
+
+                try:
+                    buf = os.read(fd, read_size)
+                except OSError as e:
+                    debug(f"{dev.desc.name}: read failed: {e}")
+                    return None
+                if not buf:
+                    continue
+
+                debug(f"{dev.desc.name}: received {hexbuf(buf)} ({len(buf)} bytes) "
+                      f"[{transaction.key}]")
+                reason = transaction.rejection_reason(buf)
+                if reason is not None:
+                    debug(f"{dev.desc.name}: ignored: {reason}")
+                    continue
+
+                replies[transaction.key] = buf
+                break
+
+        if dev.desc.parse is None:
+            return None
+        result = dev.desc.parse(replies)
+        debug(f"{dev.desc.name}: reading {result}")
+        return result
+    finally:
+        os.close(fd)
+
+# Reads a device's power status: waits for a report the schema accepts or for
 # the schema's timeout. O_NONBLOCK + poll() makes it sleep in kernel with 0 CPU
 # utilisation. Returns status dict {"percentage", "charging"} or None.
 def read_status_hw(dev):
     schema = dev.source
+    if isinstance(schema, RequestSchema) and schema.transactions:
+        return read_transaction_status_hw(dev, schema)
     if isinstance(schema, FeatureReportSchema):
         return read_feature_status(dev, schema)
 
@@ -767,34 +912,52 @@ def read_status_hw(dev):
         poller.register(fd, select.POLLIN)
         deadline = time.monotonic() + schema.poll_timeout()
         buffers = {}
+        wanted = ", ".join(f"{r:#04x}" for r in needed)
+
+        def no_reply():
+            debug(f"{dev.desc.name}: no accepted reply (report {wanted}) within "
+                  f"{schema.poll_timeout():g}s ({dev.devpath})")
+            return None
 
         while True:
             timeout_ms = int((deadline - time.monotonic()) * 1000)
             if timeout_ms <= 0:
-                return None
+                return no_reply()
 
             events = poller.poll(timeout_ms)
             if not events:
-                return None
+                return no_reply()
 
             _, revents = events[0]
             # POLLERR/POLLHUP/POLLNVAL = device error / disconnected / invalid FD
             if revents & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                debug(f"{dev.desc.name}: device error or disconnect "
+                      f"(poll flags {revents:#x})")
                 return None
             if not (revents & select.POLLIN):
                 return None
 
             try:
                 buf = os.read(fd, read_size)
-            except OSError:
+            except OSError as e:
+                debug(f"{dev.desc.name}: read failed: {e}")
                 return None
             if not buf:
                 continue
 
+            debug(f"{dev.desc.name}: received {hexbuf(buf)} ({len(buf)} bytes)")
             report_id = buf[0]
-            if report_id not in needed or len(buf) < needed[report_id]:
+            if report_id not in needed:
+                debug(f"{dev.desc.name}: ignored: report id {report_id:#04x} is not a "
+                      f"battery report - this device answers on {wanted}")
                 continue
-            if not schema.valid(buf):
+            if len(buf) < needed[report_id]:
+                debug(f"{dev.desc.name}: ignored: {len(buf)} bytes is fewer than the "
+                      f"{needed[report_id]} needed to read report {report_id:#04x}")
+                continue
+            reason = schema.rejection_reason(buf)
+            if reason is not None:
+                debug(f"{dev.desc.name}: ignored: {reason}")
                 continue
 
             buffers[report_id] = buf
@@ -803,10 +966,15 @@ def read_status_hw(dev):
                 if dev.desc.parse is not None:
                     result = dev.desc.parse(buffers)
                     if result is KEEP_READING:
+                        debug(f"{dev.desc.name}: {hexbuf(buf)} looks plausible "
+                              f"but parse() says keep waiting")
                         buffers.pop(report_id, None)  # not the battery frame; keep waiting for a better one
                         continue
+                    debug(f"{dev.desc.name}: reading {result}")
                     return result
-                return interpret(schema, buffers)
+                status = interpret(schema, buffers)
+                debug(f"{dev.desc.name}: reading {status}")
+                return status
     finally:
         os.close(fd)
 
@@ -823,7 +991,6 @@ def read_status(dev):
 _SIMULATE_DEVICES = [
     ("Keychron M5", "sim-keychron-m5", 0x3434, "d028", "mouse", 88, False),
     ("Steam Controller 2", "sim-steam-controller-2", 0x28DE, "1304", "gamepad", 85, True),
-    ("Logitech G733", "sim-g733", 0x046D, "0ab5", "audio-headset", 64, True),
     ("Glorious Model O Wireless", "sim-glorious-model-o", 0x258A, "2022", "mouse", 42, False),
 ]
 
@@ -854,9 +1021,17 @@ def _device_entry(dev):
                 "vid": f"{dev.desc.vid:04x}", "pid": f"{dev.pid:04x}",
                 "unblock_command": udev_unblock_command(dev.desc.vid),
                 "deviceType": dev.desc.device_type.value}
+    # Found, openable, but no reading - e.g. a headset the schema can't make
+    # answer. Normally this entry is dropped (invisible); with --debug we make
+    # the drop explicit so the cause is visible in the helper's stderr.
+    debug(f"{dev.desc.name}: found but read returned nothing - entry dropped "
+          f"({dev.devpath})")
     return None
 
 def main():
+    if _DEBUG:
+        # Strip the flag so the logic below sees the same argv as without it.
+        sys.argv.pop(sys.argv.index("--debug"))
     if len(sys.argv) > 1 and sys.argv[1] == "--simulate":
         print(json.dumps(_simulate()))
         sys.exit(0)

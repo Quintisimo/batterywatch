@@ -13,6 +13,11 @@ ConfigModel {
         source: "config/Modules.qml"
     }
     ConfigCategory {
+        name: i18n("Notification")
+        icon: "notification-active"
+        source: "config/Notifications.qml"
+    }
+    ConfigCategory {
         name: i18n("Advanced settings")
         icon: "settings-configure"
         source: "config/AdvancedSettings.qml"

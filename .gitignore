@@ -9,6 +9,7 @@ __pycache__/
 *.user
 *.ini
 *.local
+/.claude/
 
 # Internal task notes
 .future-tasks/

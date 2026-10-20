@@ -12,6 +12,8 @@ sysfs + hidraw devices and verifies every behavior the widget depends on:
   Azoth (ROG):    Wired, standard 2.4 GHz, and OMNI request-response
                   transports; their control-interface targeting, battery and
                   charging-state decode, blocked reporting, and udev rules.
+  Barracuda X Chroma (Razer): ordered battery + charging requests, strict
+                  reply correlation/validation, captured-packet decoding.
   SC2 (stream):   battery decode from stream report, charging state, no write.
 
 Written as plain pytest-style test_*() functions so they read like idiomatic
@@ -73,6 +75,31 @@ scenario = {"uevents": {}, "fake_devs": {}, "reply_fd": None, "reply_buf": bytea
             "reply_queue": [], "writes": [], "write_data": [], "reads": [], "read_sizes": [],
             "open_flags": [], "descriptors": {}, "descriptor_reads": 0}
 
+RAZER_BATTERY_REQUEST = bytes.fromhex(
+    "02 00 60 00 00 00 04 00 00 80 21 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 c7 00"
+)
+RAZER_BATTERY_REPLY = bytes.fromhex(
+    "02 02 60 00 00 00 05 00 80 80 21 01 01 64 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 22 00"
+)
+RAZER_CHARGING_REQUEST = bytes.fromhex(
+    "02 00 60 00 00 00 04 00 00 80 2a 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 cc 00"
+)
+RAZER_CHARGING_REPLY = bytes.fromhex(
+    "02 02 60 00 00 00 05 00 80 80 2a 01 01 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 4d 00"
+)
+
 def m5_uevent(node, pid="0000D028", name="Keychron Keychron Ultra-Link 8K", iface=4):
     return (f"DRIVER=hid-generic\nHID_ID=0003:00003434:{pid}\n"
             f"HID_NAME={name}\nHID_PHYS=usb-0000:00:14.0-11/input{iface}\nHID_UNIQ=\n")
@@ -87,7 +114,10 @@ def fake_open(path, mode="r", *a, **k):
         node = path.split("/")[4]
         if path.endswith("report_descriptor"):
             scenario["descriptor_reads"] += 1
-            return io.BytesIO(scenario["descriptors"].get(node, b""))
+            desc = scenario["descriptors"].get(node)
+            if desc is None:      # node present but its descriptor unreadable
+                raise OSError(5, "Input/output error")
+            return io.BytesIO(desc)
         return io.StringIO(scenario["uevents"][node])
     return builtins.open(path, mode, *a, **k)
 
@@ -143,11 +173,11 @@ def install_m5_scenario(pid="0000D028", name="Keychron Keychron Ultra-Link 8K", 
     scenario["reads"] = []
     scenario["read_sizes"] = []
     scenario["open_flags"] = []
+    scenario["descriptors"] = {}
+    scenario["descriptor_reads"] = 0
     scenario["reply_buf"] = bytearray(64)
     scenario["reply_queue"] = []
     scenario["reply_fd"] = 306
-    scenario["descriptors"] = {}
-    scenario["descriptor_reads"] = 0
 
 def install_sc2_scenario():
     scenario["uevents"] = {
@@ -162,38 +192,11 @@ def install_sc2_scenario():
     scenario["reads"] = []
     scenario["read_sizes"] = []
     scenario["open_flags"] = []
+    scenario["descriptors"] = {}
+    scenario["descriptor_reads"] = 0
     scenario["reply_buf"] = bytearray(16)
     scenario["reply_queue"] = []
     scenario["reply_fd"] = 207
-    scenario["descriptors"] = {}
-    scenario["descriptor_reads"] = 0
-
-def hid_descriptor(usage_page=0xFF43):
-    # minimal HID report descriptor declaring one usage page + a 2-byte usage
-    page_item = bytes([0x05, usage_page]) if usage_page <= 0xFF else bytes([0x06, usage_page & 0xFF, (usage_page >> 8) & 0xFF])
-    return page_item + bytes([0x0A, 0x02, 0x02]) + b"\xC0"
-
-def install_g733_scenario(iface=3, usage_page=0xFF43):
-    # Logitech HID++ headset: battery node on usage page 0xff43 (iface is now
-    # irrelevant to matching - only the report descriptor page decides), request
-    # 11 ff 08 0a, 0x10 reply
-    scenario["uevents"] = {
-        "hidraw8": ("DRIVER=hid-generic\nHID_ID=0003:0000046D:00000AB5\n"
-                    "HID_NAME=Logitech G733 LIGHTSPEED\n"
-                    f"HID_PHYS=usb-0000:00:14.0-11/input{iface}\nHID_UNIQ=\n"),
-    }
-    scenario["fake_devs"] = {"/dev/hidraw8": 208}
-    scenario["deny"] = False
-    scenario["writes"] = []
-    scenario["write_data"] = []
-    scenario["reads"] = []
-    scenario["read_sizes"] = []
-    scenario["open_flags"] = []
-    scenario["reply_buf"] = bytearray(8)
-    scenario["reply_queue"] = []
-    scenario["reply_fd"] = 208
-    scenario["descriptors"] = {"hidraw8": hid_descriptor(usage_page)} if usage_page is not None else {}
-    scenario["descriptor_reads"] = 0
 
 def hid_descriptor_pages(*pages):
     # Descriptor declaring several usage pages, as real multi-collection
@@ -257,10 +260,88 @@ def install_azoth_scenario(pid="00001ACE", with_blocked=False):
     scenario["reads"] = []
     scenario["read_sizes"] = []
     scenario["open_flags"] = []
+    scenario["descriptors"] = {}
+    scenario["descriptor_reads"] = 0
     scenario["reply_buf"] = bytearray(65)
     scenario["reply_queue"] = []
     scenario["reply_fd"] = 309 if pid == "00001ACE" else 308
-    scenario["descriptors"] = {}
+
+# ── Synthetic vendor-usage-page device ──────────────────────────────────────
+# Stands in for the device families that put the battery collection on a vendor
+# page (Glorious mice and friends): which interface carries it cannot be told
+# from the interface number, so the report descriptor decides.
+_TEST_PID = 0xDEAD
+_TEST_VID = 0xBEEF
+
+def hid_descriptor(usage_page=0xFF01):
+    # minimal HID report descriptor declaring one usage page + a 2-byte usage
+    page_item = (bytes([0x05, usage_page]) if usage_page <= 0xFF
+                 else bytes([0x06, usage_page & 0xFF, (usage_page >> 8) & 0xFF]))
+    return page_item + bytes([0x0A, 0x02, 0x02]) + b"\xC0"
+
+def install_vendor_scenario(usage_page=0xFF01, iface=3, with_blocked=False):
+    scenario["uevents"] = {
+        "hidraw8": (f"DRIVER=hid-generic\nHID_ID=0003:{_TEST_VID:08X}:{_TEST_PID:08X}\n"
+                    f"HID_NAME=Test Vendor Mouse\n"
+                    f"HID_PHYS=usb-0000:00:14.0-11/input{iface}\nHID_UNIQ=\n"),
+    }
+    scenario["fake_devs"] = {"/dev/hidraw8": 208}
+    scenario["deny"] = with_blocked
+    scenario["writes"] = []
+    scenario["write_data"] = []
+    scenario["reads"] = []
+    scenario["read_sizes"] = []
+    scenario["open_flags"] = []
+    scenario["descriptors"] = ({"hidraw8": hid_descriptor(usage_page)}
+                               if usage_page is not None else {})
+    scenario["descriptor_reads"] = 0
+    scenario["reply_buf"] = bytearray(16)
+    scenario["reply_queue"] = []
+    scenario["reply_fd"] = 208
+
+@contextlib.contextmanager
+def vendor_device(usage_page=rhd.VENDOR_USAGE_PAGE, pid=_TEST_PID, vid=_TEST_VID):
+    """Registers a throwaway device whose node is selected by usage page."""
+    dev = rhd.Device(
+        name="Test Vendor Mouse",
+        device_type=rhd.DeviceType.MOUSE,
+        vid=vid,
+        variants=(rhd.DeviceVariant(pid, None, usage_page),),
+        source=rhd.InputStreamSchema(
+            charge=rhd.DataPos(0x43, 2),
+            charge_range=None,
+            status=rhd.ChargingStates(pos=rhd.DataPos(0x43, 1), states={0x01: False, 0x02: True}),
+        ),
+        parse=None,
+    )
+    rhd.KNOWN_DEVICES.append(dev)
+    # _USAGE_PAGE_PIDS is derived from the registry, so refresh it for the test
+    rhd._USAGE_PAGE_PIDS.add(pid)
+    try:
+        yield dev
+    finally:
+        rhd.KNOWN_DEVICES.remove(dev)
+        rhd._USAGE_PAGE_PIDS.discard(pid)
+
+def install_razer_scenario(with_blocked=False, usage_page=0xFF14):
+    scenario["uevents"] = {
+        "hidraw5": ("DRIVER=hid-generic\nHID_ID=0003:00001532:00000574\n"
+                    "HID_NAME=MediaTek Inc Razer Barracuda X Chroma\n"
+                    "HID_PHYS=usb-0000:00:14.0-6.1.2/input3\n"
+                    "HID_UNIQ=0000000000000000\n"),
+    }
+    scenario["fake_devs"] = {"/dev/hidraw5": 205}
+    scenario["deny"] = with_blocked
+    scenario["writes"] = []
+    scenario["write_data"] = []
+    scenario["reads"] = []
+    scenario["read_sizes"] = []
+    scenario["open_flags"] = []
+    scenario["reply_buf"] = bytearray(0)
+    scenario["reply_queue"] = [RAZER_BATTERY_REPLY, RAZER_CHARGING_REPLY]
+    scenario["reply_fd"] = 205
+    scenario["descriptors"] = ({"hidraw5": hid_descriptor(usage_page)}
+                               if usage_page is not None else {})
     scenario["descriptor_reads"] = 0
 
 def set_m5_reply(byte20=87, report_id=0xB4, cmd=0x06):
@@ -393,6 +474,19 @@ def test_non_azoth_hid_uniq_is_not_resolved_or_sanitized():
     install_m5_scenario()
     scenario["uevents"]["hidraw6"] = m5_uevent("hidraw6")[:-1] + "serial\x18\xbe\n"
     assert rhd.find_devices()[0].serial == "serial\x18\xbe"
+
+def test_missing_hid_uniq_exposes_the_physical_identity():
+    install_m5_scenario()
+    set_m5_reply(87)
+    entry = rhd._device_entry(rhd.find_devices()[0])
+    assert entry["serial"] == "usb-0000:00:14.0-11"
+
+def test_meaningful_hid_uniq_remains_displayable():
+    install_m5_scenario()
+    set_m5_reply(87)
+    scenario["uevents"]["hidraw6"] = m5_uevent("hidraw6")[:-1] + "SN000123\n"
+    entry = rhd._device_entry(rhd.find_devices()[0])
+    assert entry["serial"] == "SN000123"
 
 def test_reference_match():
     # Reference match (github.com/itayavra/batterywatch/issues/5)
@@ -617,6 +711,155 @@ def test_azoth_blocked_entry_and_udev_rule_cover_both_variants():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Razer Barracuda X Chroma: ordered property requests on report 0x02
+# ══════════════════════════════════════════════════════════════════════════
+def test_razer_profile_uses_the_exact_captured_requests():
+    dev = next(dev for dev in rhd.KNOWN_DEVICES
+               if dev.name == "Razer Barracuda X Chroma")
+    assert dev.device_type == rhd.DeviceType.HEADSET
+    assert dev.variants == (rhd.DeviceVariant(0x0574, None, 0xFF14),)
+    assert [transaction.key for transaction in dev.source.transactions] == [
+        "battery", "charging"
+    ]
+    assert [transaction.request for transaction in dev.source.transactions] == [
+        RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST
+    ]
+
+def test_razer_real_captures_decode_after_two_ordered_requests():
+    install_razer_scenario()
+    dev = rhd.find_devices()[0]
+    assert rhd.read_status(dev) == {"percentage": 100, "charging": False}
+    assert scenario["write_data"] == [RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST]
+    assert scenario["read_sizes"] == [64, 64]
+
+def test_transactions_can_omit_the_single_request_without_an_extra_write():
+    install_razer_scenario()
+    dev = rhd.find_devices()[0]
+    schema = rhd.RequestSchema(
+        charge=rhd.DataPos(0x02, 13),
+        charge_range=None,
+        status=None,
+        transactions=dev.source.transactions,
+    )
+    assert rhd.read_status(dev._replace(source=schema)) == {
+        "percentage": 100, "charging": False
+    }
+    assert scenario["write_data"] == [RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST]
+
+def test_razer_all_zero_hid_uniq_uses_existing_physical_path_fallback():
+    install_razer_scenario()
+    entry = rhd._device_entry(rhd.find_devices()[0])
+    assert entry["serial"] == "usb-0000:00:14.0-6.1.2"
+
+def test_razer_correlates_same_report_id_by_echoed_property():
+    install_razer_scenario()
+    scenario["reply_queue"] = [
+        RAZER_CHARGING_REPLY,  # report 0x02, but not the requested property 0x21
+        RAZER_BATTERY_REPLY,
+        RAZER_CHARGING_REPLY,
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": False
+    }
+    assert len(scenario["reads"]) == 3
+    assert scenario["write_data"] == [RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST]
+
+def test_razer_correlates_property_reply_by_report_id_too():
+    install_razer_scenario()
+    wrong_report = bytearray(RAZER_BATTERY_REPLY)
+    wrong_report[0] = 0x07
+    scenario["reply_queue"] = [
+        bytes(wrong_report), RAZER_BATTERY_REPLY, RAZER_CHARGING_REPLY
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": False
+    }
+    assert len(scenario["reads"]) == 3
+
+def test_razer_rejects_bad_checksum_then_accepts_real_capture():
+    install_razer_scenario()
+    bad_checksum = bytearray(RAZER_BATTERY_REPLY)
+    bad_checksum[62] ^= 0x01
+    scenario["reply_queue"] = [
+        bytes(bad_checksum), RAZER_BATTERY_REPLY, RAZER_CHARGING_REPLY
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": False
+    }
+    assert len(scenario["reads"]) == 3
+
+def test_razer_rejects_truncated_and_malformed_property_replies():
+    install_razer_scenario()
+    bad_header = bytearray(RAZER_BATTERY_REPLY)
+    bad_header[11] = 0x00
+    scenario["reply_queue"] = [
+        RAZER_BATTERY_REPLY[:-1], bytes(bad_header),
+        RAZER_BATTERY_REPLY, RAZER_CHARGING_REPLY,
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": False
+    }
+    assert len(scenario["reads"]) == 4
+
+def test_razer_rejects_checksum_correct_out_of_range_values():
+    install_razer_scenario()
+    invalid_battery = bytearray(RAZER_BATTERY_REPLY)
+    invalid_battery[13] = 101
+    invalid_battery[62] = 0x23
+    invalid_charging = bytearray(RAZER_CHARGING_REPLY)
+    invalid_charging[13] = 2
+    invalid_charging[62] = 0x4F
+    scenario["reply_queue"] = [
+        bytes(invalid_battery), RAZER_BATTERY_REPLY,
+        bytes(invalid_charging), RAZER_CHARGING_REPLY,
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": False
+    }
+    assert len(scenario["reads"]) == 4
+
+def test_razer_charging_value_one_decodes_true():
+    install_razer_scenario()
+    charging = bytearray(RAZER_CHARGING_REPLY)
+    charging[13] = 1
+    charging[62] = 0x4C
+    scenario["reply_queue"] = [RAZER_BATTERY_REPLY, bytes(charging)]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": True
+    }
+
+def test_razer_second_transaction_timeout_publishes_no_partial_state():
+    install_razer_scenario()
+    scenario["reply_queue"] = [RAZER_BATTERY_REPLY]
+    assert rhd.read_status(rhd.find_devices()[0]) is None
+    assert scenario["write_data"] == [RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST]
+
+def test_razer_first_transaction_timeout_does_not_send_second_request():
+    install_razer_scenario()
+    scenario["reply_queue"] = []
+    assert rhd.read_status(rhd.find_devices()[0]) is None
+    assert scenario["write_data"] == [RAZER_BATTERY_REQUEST]
+
+def test_razer_discovery_requires_vendor_usage_page_ff14():
+    install_razer_scenario()
+    assert [dev.devpath for dev in rhd.find_devices()] == ["/dev/hidraw5"]
+
+    install_razer_scenario(usage_page=0xFF13)
+    assert rhd.find_devices() == []
+
+def test_razer_blocked_entry_uses_existing_request_schema_udev_path():
+    install_razer_scenario(with_blocked=True)
+    dev = rhd.find_devices()[0]
+    assert rhd.is_blocked(dev) is True
+    entry = rhd._device_entry(dev)
+    assert entry["blocked"] is True
+    assert entry["vid"] == "1532"
+    assert entry["pid"] == "0574"
+    assert 'ATTRS{idProduct}=="0574"' in rhd.udev_rule_for(0x1532)
+    assert 'MODE="0660"' in rhd.udev_rule_for(0x1532)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # M5: blocked (needs udev rule) reporting
 # ══════════════════════════════════════════════════════════════════════════
 def test_is_blocked_true_on_eacces():
@@ -642,6 +885,8 @@ def test_is_blocked_uses_effective_variant_schema_open_mode():
     assert scenario["open_flags"] == [os.O_RDWR | os.O_NONBLOCK]
 
     scenario["open_flags"] = []
+    scenario["descriptors"] = {}
+    scenario["descriptor_reads"] = 0
     stream_variant = rhd.FoundDevice(m5.devpath, m5.serial, request_device, m5.pid, stream_device.source)
     assert rhd.is_blocked(stream_variant) is False
     assert scenario["open_flags"] == [os.O_RDONLY | os.O_NONBLOCK]
@@ -718,8 +963,6 @@ def test_simulate_both_blocked_before_any_rule():
              "unblock_command": rhd.udev_unblock_command(0x3434), "deviceType": "mouse"},
             {"name": "Steam Controller 2", "serial": "sim-steam-controller-2", "blocked": True, "vid": "28de", "pid": "1304",
              "unblock_command": rhd.udev_unblock_command(0x28de), "deviceType": "gamepad"},
-            {"name": "Logitech G733", "serial": "sim-g733", "blocked": True, "vid": "046d", "pid": "0ab5",
-             "unblock_command": rhd.udev_unblock_command(0x046d), "deviceType": "audio-headset"},
             {"name": "Glorious Model O Wireless", "serial": "sim-glorious-model-o", "blocked": True, "vid": "258a", "pid": "2022",
              "unblock_command": rhd.udev_unblock_command(0x258a), "deviceType": "mouse"},
         ]
@@ -732,8 +975,6 @@ def test_simulate_m5_reports_after_its_rule():
             {"name": "Keychron M5", "serial": "sim-keychron-m5", "percentage": 88, "charging": False, "deviceType": "mouse"},
             {"name": "Steam Controller 2", "serial": "sim-steam-controller-2", "blocked": True, "vid": "28de", "pid": "1304",
              "unblock_command": rhd.udev_unblock_command(0x28de), "deviceType": "gamepad"},
-            {"name": "Logitech G733", "serial": "sim-g733", "blocked": True, "vid": "046d", "pid": "0ab5",
-             "unblock_command": rhd.udev_unblock_command(0x046d), "deviceType": "audio-headset"},
             {"name": "Glorious Model O Wireless", "serial": "sim-glorious-model-o", "blocked": True, "vid": "258a", "pid": "2022",
              "unblock_command": rhd.udev_unblock_command(0x258a), "deviceType": "mouse"},
         ]
@@ -746,159 +987,126 @@ def test_simulate_both_report_after_both_rules():
         assert json.loads(run_main_capture()) == [
             {"name": "Keychron M5", "serial": "sim-keychron-m5", "percentage": 88, "charging": False, "deviceType": "mouse"},
             {"name": "Steam Controller 2", "serial": "sim-steam-controller-2", "percentage": 85, "charging": True, "deviceType": "gamepad"},
-            {"name": "Logitech G733", "serial": "sim-g733", "blocked": True, "vid": "046d", "pid": "0ab5",
-             "unblock_command": rhd.udev_unblock_command(0x046d), "deviceType": "audio-headset"},
             {"name": "Glorious Model O Wireless", "serial": "sim-glorious-model-o", "blocked": True, "vid": "258a", "pid": "2022",
              "unblock_command": rhd.udev_unblock_command(0x258a), "deviceType": "mouse"},
         ]
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Logitech headset (G733): voltage read
-# ══════════════════════════════════════════════════════════════════════════
-def test_voltage_percentage_curve():
-    assert rhd._voltage_percentage(4100, rhd.G633_CURVE) == 100
-    assert rhd._voltage_percentage(4050, rhd.G633_CURVE) == 93   # 80 + 20 * 100/150 between 3950-4100
-    assert rhd._voltage_percentage(3150, rhd.G633_CURVE) == 0
-    assert rhd._voltage_percentage(3000, rhd.G633_CURVE) == 0    # below curve floor -> clamp to 0
-
-def g733_frame(status=0x01, voltage_mv=4000, state=0x03):
-    buf = bytearray(8)
-    buf[0] = 0x10
-    buf[1] = 0xFF
-    buf[2] = status
-    buf[3] = 0x00
-    buf[4] = (voltage_mv >> 8) & 0xFF
-    buf[5] = voltage_mv & 0xFF
-    buf[6] = state
-    return buf
-
-def set_g733_reply(status=0x01, voltage_mv=4000, state=0x03):
-    scenario["reply_buf"] = g733_frame(status, voltage_mv, state)
-
-def test_logitech_voltage_parse_basic():
-    install_g733_scenario()
-    set_g733_reply(status=0x01, voltage_mv=4050, state=0x01)
-    assert rhd.find_devices()[0].desc.name == "Logitech G733/G933/G935"
-    assert rhd.read_status(rhd.find_devices()[0]) == {"percentage": 93, "charging": False}
-
-def test_logitech_voltage_parse_charging():
-    install_g733_scenario()
-    set_g733_reply(status=0x01, voltage_mv=4100, state=0x03)
-    assert rhd.read_status(rhd.find_devices()[0]) == {"percentage": 100, "charging": True}
-
-def test_logitech_voltage_parse_off_returns_none():
-    install_g733_scenario()
-    set_g733_reply(status=0xFF, voltage_mv=4100, state=0x03)
-    assert rhd.read_status(rhd.find_devices()[0]) is None
-
-def test_logitech_voltage_parse_low_voltage_returns_none():
-    # a below-curve voltage is not the battery frame: keep waiting, then time out
-    install_g733_scenario()
-    scenario["reply_buf"] = bytearray(0)
-    scenario["reply_queue"] = [g733_frame(status=0x01, voltage_mv=3100, state=0x01)]
-    assert rhd.read_status(rhd.find_devices()[0]) is None
-
-def test_logitech_bad_frame_then_good_frame_keeps_reading():
-    # a plausible-looking but wrong frame (implausible voltage) must not be
-    # reported; the helper keeps waiting and returns the real battery reply
-    install_g733_scenario()
-    scenario["reply_buf"] = bytearray(0)
-    scenario["reply_queue"] = [
-        g733_frame(status=0x01, voltage_mv=0xFFFF, state=0x01),   # garbage frame
-        g733_frame(status=0x01, voltage_mv=4050, state=0x01),     # real reply
-    ]
-    assert rhd.read_status(rhd.find_devices()[0]) == {"percentage": 93, "charging": False}
-
-def test_logitech_g733_match_and_udev_rule():
-    install_g733_scenario()
-    sdev = rhd.find_devices()[0]
-    assert sdev.desc.name == "Logitech G733/G933/G935"
-    assert sdev.pid == 0x0AB5
-    assert sdev.desc.source.request == bytes([0x11, 0xFF, 0x08, 0x0A]) + b"\x00" * 16, "20-byte long request"
-    rule = rhd.udev_rule_for(sdev.desc.vid)
-    assert 'MODE="0660"' in rule, "headset needs write access to answer the request"
-    assert "SYMLINK" not in rule
-
-def test_logitech_g733_offline_produces_no_entry():
-    # when the headset is off, replies are status 0xff and must be skipped
-    install_g733_scenario()
-    set_g733_reply(status=0xFF, voltage_mv=0, state=0x03)
-    assert rhd._device_entry(rhd.find_devices()[0]) is None
-
-def test_logitech_headset_families():
-    headsets = {d.name: d for d in rhd.KNOWN_DEVICES if d.device_type == rhd.DeviceType.HEADSET}
-    assert set(headsets) == {"Logitech G733/G933/G935", "Logitech G533", "Logitech G535", "Logitech G PRO Series"}
-    for d in headsets.values():
-        assert all(v.iface == 3 or v.usage_page == 0xFF43 for v in d.variants), \
-            f"{d.name}: battery node pinned by interface 3 or vendor usage page"
-        assert d.source.request == bytes([0x11, 0xFF, d.source.request[2], d.source.request[3]]) + b"\x00" * 16, f"{d.name}: 20-byte long request"
-        assert d.parse is not None
-    assert [v.pid for v in headsets["Logitech G733/G933/G935"].variants] == [0x0A5B, 0x0A87, 0x0AB5, 0x0AFE, 0x0B1F]
-    # G PRO family drops the X2 (0x0AFB/0x0AFC): Solaar lists the X2 as 0x0AF7
-    # on the separate Centurion transport, a different protocol family
-    assert [v.pid for v in headsets["Logitech G PRO Series"].variants] == [0x0AA7, 0x0AAA, 0x0ABA]
-    assert all(v.usage_page == 0xFF43 for v in headsets["Logitech G PRO Series"].variants)
-    assert headsets["Logitech G533"].source.request[:4] == bytes([0x11, 0xFF, 0x07, 0x01])
-    assert headsets["Logitech G535"].source.request[:4] == bytes([0x11, 0xFF, 0x05, 0x0D])
-    assert headsets["Logitech G535"].variants[0].iface == 3, "G535: consumer page is generic, pins interface 3"
-    assert headsets["Logitech G PRO Series"].source.request[:4] == bytes([0x11, 0xFF, 0x06, 0x0D])
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# Logitech headset: battery-node discovery via report-descriptor usage page
+# Report-descriptor usage pages: selecting the battery node among a device's
+# interfaces when the interface number cannot say which one carries it
 # ══════════════════════════════════════════════════════════════════════════
 def test_parse_usage_pages_detects_vendor_page():
-    pages = rhd._parse_usage_pages(bytes([0x06, 0x43, 0xFF, 0x0A, 0x02, 0x02]) + b"\xC0")
-    assert 0xFF43 in pages, f"vendor page not detected: {pages!r}"
+    assert rhd._parse_usage_pages(bytes([0x06, 0x43, 0xFF, 0x0A, 0x02, 0x02]) + b"\xC0") == {0xFF43}
 
 def test_parse_usage_pages_skips_long_items():
-    # a long item (0xFE) before the usage-page item must be skipped cleanly
-    data = bytes([0xFE, 0x03, 0xAA, 0xBB, 0xCC, 0x06, 0x43, 0xFF])
-    assert 0xFF43 in rhd._parse_usage_pages(data)
+    # 0xFE = long item: next byte is the payload length, which must not be
+    # decoded as items or it would fabricate usage pages
+    data = bytes([0xFE, 0x03, 0x06, 0x43, 0xFF,
+                  0x06, 0x01, 0xFF, 0x0A, 0x02, 0x02])
+    assert rhd._parse_usage_pages(data) == {0xFF01}
 
 def test_parse_usage_pages_tolerates_garbage():
     assert rhd._parse_usage_pages(b"") == set()
     assert rhd._parse_usage_pages(b"\xFF\xFF\xFF\xFF") == set()  # truncated items
 
-def test_discovery_matches_battery_node_by_usage_page_not_iface():
-    # the battery node is found by its 0xff43 vendor page even when the kernel
-    # numbers the interface 4 (not the Solaar/headsetcontrol "interface 3")
-    install_g733_scenario(iface=4)
-    devs = rhd.find_devices()
-    assert [d.devpath for d in devs] == ["/dev/hidraw8"], f"found: {[d.devpath for d in devs]!r}"
+def test_parse_usage_pages_realistic_mouse_descriptor():
+    # 4 collections (generic desktop, buttons+LEDs, consumer, vendor) in one
+    # node; the flat set is what the page test needs, so every page comes back
+    data = (bytes([0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0xC0])
+            + bytes([0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01,
+                     0x75, 0x01, 0x95, 0x02, 0x05, 0x08, 0x19, 0x01, 0x29, 0x02,
+                     0x09, 0x01, 0x81, 0x02, 0x75, 0x01, 0x95, 0x02, 0x81, 0x01,
+                     0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0xC0])
+            + bytes([0x06, 0x00, 0xFF, 0x09, 0x02, 0x15, 0x00, 0x25, 0x01,
+                     0x75, 0x01, 0x95, 0x01, 0x81, 0x02, 0x75, 0x01, 0x95, 0x01,
+                     0x81, 0x01, 0xC0]))
+    assert rhd._parse_usage_pages(data) == {0x01, 0x08, 0x09, 0x0C, 0xFF00}
 
-def test_discovery_rejects_node_without_vendor_page():
-    install_g733_scenario(usage_page=0x000C)  # consumer page only: not the battery node
-    assert rhd.find_devices() == []
+def test_parse_usage_pages_two_byte_usage_keeps_the_current_page():
+    # a 2-byte Usage is a usage ID within the current page, NOT a page number
+    # in its high byte: 0x0A 0x02 0x02 under page 0xff43 stays on 0xff43
+    data = bytes([0x06, 0x43, 0xFF, 0x0A, 0x02, 0x02])
+    assert rhd._parse_usage_pages(data) == {0xFF43}, "no fabricated 0x02 page"
 
-def test_discovery_picks_battery_node_among_multiple_interfaces():
-    # the dongle exposes several HID nodes: only the one declaring 0xff43 matches
-    install_g733_scenario(iface=3)
-    scenario["uevents"]["hidraw9"] = (
-        "DRIVER=hid-generic\nHID_ID=0003:0000046D:00000AB5\n"
-        "HID_NAME=Logitech G733 LIGHTSPEED\n"
-        "HID_PHYS=usb-0000:00:14.0-11/input2\nHID_UNIQ=\n")
-    scenario["descriptors"]["hidraw9"] = bytes([0x05, 0x0C]) + b"\xC0"  # consumer page, no 0xff43
-    scenario["fake_devs"]["/dev/hidraw9"] = 209
-    set_g733_reply(status=0x01, voltage_mv=4050, state=0x01)  # battery reply on the battery node
-    devs = rhd.find_devices()
-    assert [d.devpath for d in devs] == ["/dev/hidraw8"], f"found: {[d.devpath for d in devs]!r}"
-    assert rhd.read_status(devs[0]) == {"percentage": 93, "charging": False}
+def test_match_device_selects_node_by_usage_page_not_iface():
+    with vendor_device(0xFF01):
+        assert rhd.match_device(_TEST_VID, _TEST_PID, 3, {0xFF01}) is not None
+        assert rhd.match_device(_TEST_VID, _TEST_PID, 0, {0xFF01}) is not None, "iface irrelevant"
+        # right PID, wrong descriptor: not the battery node
+        assert rhd.match_device(_TEST_VID, _TEST_PID, 3, {0x0C}) is None
+        # no descriptor read at all
+        assert rhd.match_device(_TEST_VID, _TEST_PID, 3, set()) is None
+
+def test_match_device_vendor_sentinel_accepts_any_vendor_page():
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        for page in (0xFF00, 0xFF01, 0xFF43, 0xFFFF):
+            assert rhd.match_device(_TEST_VID, _TEST_PID, 3, {page}) is not None, hex(page)
+        for page in (0x0C, 0x01, 0xFF, 0xFEFF):
+            assert rhd.match_device(_TEST_VID, _TEST_PID, 3, {page}) is None, hex(page)
+
+def test_match_device_vendor_sentinel_never_matches_an_unregistered_device():
+    # 0xff00 is declared by plenty of non-vendor gear (Razer mice, Microsoft
+    # keyboards); the sentinel must stay gated behind a vid/pid match
+    assert rhd.match_device(0x1532, 0x005C, 0, {0xFF00}) is None
+    assert rhd.match_device(0x045E, 0x00DB, 0, {0xFF00}) is None
+
+def test_discovery_reads_descriptor_and_selects_vendor_node():
+    install_vendor_scenario(usage_page=0xFF01)
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        devs = rhd.find_devices()
+    assert [d.devpath for d in devs] == ["/dev/hidraw8"], [d.devpath for d in devs]
+    assert scenario["descriptor_reads"] == 1, scenario["descriptor_reads"]
+
+def test_discovery_rejects_node_without_a_vendor_page():
+    install_vendor_scenario(usage_page=0x0C)  # consumer-control collection only
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        assert rhd.find_devices() == []
 
 def test_discovery_unreadable_descriptor_matches_nothing():
-    # a node whose descriptor can't be read is skipped, never mis-selected
-    install_g733_scenario(usage_page=None)
-    assert rhd.find_devices() == []
+    # descriptor present in sysfs but unreadable -> skip, never mis-select
+    install_vendor_scenario(usage_page=None)
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        assert rhd.find_devices() == []
+    assert scenario["descriptor_reads"] == 1, scenario["descriptor_reads"]
+
+def test_discovery_picks_battery_node_among_multiple_interfaces():
+    # one physical device, two hidraw nodes: only the vendor-page one is the
+    # battery collection, so the interface number must not decide
+    def uevent(node, iface):
+        return (f"DRIVER=hid-generic\nHID_ID=0003:{_TEST_VID:08X}:{_TEST_PID:08X}\n"
+                f"HID_NAME=Test Vendor Mouse\n"
+                f"HID_PHYS=usb-0000:00:14.0-11/input{iface}\nHID_UNIQ=\n")
+    scenario["uevents"] = {"hidraw8": uevent("hidraw8", 3), "hidraw9": uevent("hidraw9", 4)}
+    scenario["fake_devs"] = {"/dev/hidraw8": 308, "/dev/hidraw9": 309}
+    scenario["deny"] = False
+    scenario["writes"] = []
+    scenario["write_data"] = []
+    scenario["reads"] = []
+    scenario["read_sizes"] = []
+    scenario["open_flags"] = []
+    scenario["reply_buf"] = bytearray(16)
+    scenario["reply_queue"] = []
+    scenario["reply_fd"] = 308
+    scenario["descriptors"] = {"hidraw8": hid_descriptor(0xFF01),   # vendor: the battery node
+                               "hidraw9": hid_descriptor(0x0C)}     # consumer: not a battery
+    scenario["descriptor_reads"] = 0
+
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        devs = rhd.find_devices()
+    # one entry per physical device, and it is the vendor node (iface 3)
+    assert [d.devpath for d in devs] == ["/dev/hidraw8"], [d.devpath for d in devs]
+    assert scenario["descriptor_reads"] == 2, "one descriptor read per candidate node"
 
 def test_descriptor_read_only_for_usage_page_pids():
-    # the report descriptor is only read for PIDs with a usage_page variant
+    # descriptors are only read for PIDs with a usage_page variant
     install_m5_scenario()                     # iface-only device
     rhd.find_devices()
     assert scenario["descriptor_reads"] == 0, f"M5 must not read descriptors: {scenario['descriptor_reads']}"
-    install_g733_scenario()                   # usage-page device
-    rhd.find_devices()
-    assert scenario["descriptor_reads"] == 1, f"G733 reads exactly one: {scenario['descriptor_reads']}"
+    install_vendor_scenario()                 # usage-page device
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        rhd.find_devices()
+    assert scenario["descriptor_reads"] == 1, f"vendor device reads exactly one: {scenario['descriptor_reads']}"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1015,26 +1223,84 @@ def test_glorious_real_model_o_wireless_node_layout():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# --debug diagnostics (stderr only; stdout stays the JSON the widget reads)
+# ══════════════════════════════════════════════════════════════════════════
+@contextlib.contextmanager
+def debug_stderr():
+    saved = rhd._DEBUG
+    rhd._DEBUG = True
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(stderr):
+            yield stderr
+    finally:
+        rhd._DEBUG = saved
+
+def test_debug_output_explains_an_unanswered_request():
+    # which node, which request, what came back, why it was rejected, and that
+    # the read then timed out
+    install_m5_scenario()
+    scenario["reply_buf"] = bytearray(0)
+    scenario["reply_queue"] = [bytes([0xB4, 0x00] + [0x00] * 20)]
+    with debug_stderr() as stderr:
+        devs = rhd.find_devices()
+        assert rhd._device_entry(devs[0]) is None
+    log = stderr.getvalue()
+    assert all(line.startswith("[batterywatch] ") for line in log.splitlines() if line), log
+    assert "/dev/hidraw6" in log and "Keychron M5" in log, "device identity + node"
+    assert "3434:d028" in log and "iface 4" in log, "identity + selected interface"
+    assert "write b3 06 00 00 00" in log, "request bytes"
+    assert "received b4 00 00 00 00" in log, "received packet bytes"
+    assert "device address 0x00 does not echo the requested 0x06" in log, "rejection reason"
+    assert "no accepted reply (report 0xb4) within 1s" in log, "timeout"
+
+def test_debug_output_records_dropped_entry():
+    install_m5_scenario()
+    scenario["reply_buf"] = bytearray(0)
+    with debug_stderr() as stderr:
+        assert rhd._device_entry(rhd.find_devices()[0]) is None
+    assert "entry dropped" in stderr.getvalue()
+
+def test_debug_output_records_open_and_write_failures():
+    install_m5_scenario(with_blocked=True)
+    with debug_stderr() as stderr:
+        assert rhd.read_status(rhd.find_devices()[0]) is None
+    assert "open(/dev/hidraw6, O_RDWR) failed: [Errno 13] Permission denied" in stderr.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Helper as a subprocess (real run, no device)
 # ══════════════════════════════════════════════════════════════════════════
 def test_helper_compiles():
     assert py_compile.compile(HELPER, doraise=True) is not None
 
-def test_helper_real_run_emits_valid_json():
-    # subprocess needs the REAL os.read/write/close/listdir and select.poll - the
-    # scenario monkey-patches live on the shared os/select modules and would corrupt
-    # pipe I/O, so restore them around this real-world run, then re-patch.
+@contextlib.contextmanager
+def real_os():
+    # A subprocess needs the REAL os.read/write/close/listdir and select.poll -
+    # the scenario monkey-patches live on the shared os/select modules and would
+    # corrupt pipe I/O, so restore them around the run, then re-patch.
     os.open, os.write, os.read, os.close = real_osopen, real_oswrite, real_osread, real_osclose
     os.listdir = real_listdir
     select.poll = real_poll
     try:
-        r = subprocess.run([sys.executable, HELPER], capture_output=True, text=True,
-                           cwd=os.path.dirname(HELPER), timeout=30)
+        yield
     finally:
         patch_module()
+
+def test_helper_real_run_emits_valid_json():
+    with real_os():
+        r = subprocess.run([sys.executable, HELPER], capture_output=True, text=True,
+                           cwd=os.path.dirname(HELPER), timeout=30)
     assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr!r}"
     parsed = json.loads(r.stdout.strip())
     assert isinstance(parsed, list), f"stdout={r.stdout.strip()!r}"
+
+def test_debug_flag_keeps_stdout_valid_json():
+    with real_os():
+        r = subprocess.run([sys.executable, HELPER, "--debug", "--simulate"], capture_output=True,
+                           text=True, cwd=os.path.dirname(HELPER), timeout=30)
+    assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr!r}"
+    assert isinstance(json.loads(r.stdout.strip()), list), f"stdout={r.stdout.strip()!r}"
 
 
 # ══════════════════════════════════════════════════════════════════════════

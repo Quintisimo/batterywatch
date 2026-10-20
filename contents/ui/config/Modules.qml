@@ -7,6 +7,7 @@ import org.kde.kcmutils as KCMUtils
 KCMUtils.SimpleKCM {
     id: root
 
+    property alias cfg_enableUPowerIntegration: enableUPowerIntegration.checked
     property alias cfg_enableOpenLinkHubIntegration: enableOpenLinkHubIntegration.checked
     property alias cfg_openLinkHubApiPort: openLinkHubApiPort.value
 
@@ -16,14 +17,36 @@ KCMUtils.SimpleKCM {
     property alias cfg_enableKDEConnectIntegration: enableKDEConnectIntegration.checked
     property alias cfg_kdeConnectPollingTime: kdeConnectPollingTime.value
 
+    property alias cfg_enableBluezIntegration: enableBluezIntegration.checked
+    property alias cfg_bluezPollingTime: bluezPollingTime.value
+
     property alias cfg_enableHIDIntegration: enableHIDIntegration.checked
     property alias cfg_hidPollingTime: hidPollingTime.value
+
+    property alias cfg_enableSolaarIntegration: enableSolaarIntegration.checked
+    property alias cfg_solaarPollingTime: solaarPollingTime.value
+
+    property alias cfg_enableHeadsetControlIntegration: enableHeadsetControlIntegration.checked
+    property alias cfg_headsetControlPollingTime: headsetControlPollingTime.value
 
     Kirigami.FormLayout {
         id: page
 
         // anchors.left: parent.left
         // anchors.right: parent.right
+
+        Item {
+            Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: i18n("UPower Integration")
+        }
+
+        QQL.RowLayout {
+            Kirigami.FormData.label: i18n("Enable")
+
+            QQC2.CheckBox {
+                id: enableUPowerIntegration
+            }
+        }
 
         Item {
             Kirigami.FormData.isSection: true
@@ -35,7 +58,7 @@ KCMUtils.SimpleKCM {
 
             QQC2.CheckBox {
                 id: enableOpenLinkHubIntegration
-        }
+            }
         }
 
         QQC2.SpinBox {
@@ -124,6 +147,45 @@ KCMUtils.SimpleKCM {
 
         Item {
             Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: i18n("BlueZ Integration")
+        }
+
+        QQL.RowLayout {
+            Kirigami.FormData.label: i18n("Enable")
+
+            QQC2.CheckBox {
+                id: enableBluezIntegration
+            }
+        }
+
+        QQL.RowLayout {
+            Kirigami.FormData.label: i18n("Polling interval")
+
+            QQC2.SpinBox {
+                id: bluezPollingTime
+                enabled: enableBluezIntegration.checked
+                from: 1
+                to: 3600
+            }
+
+            QQC2.Label {
+                text: i18n("s")
+                opacity: enableBluezIntegration.checked ? 0.7 : 0.5
+            }
+
+            QQC2.ToolButton {
+                id: bluezPollingHelp
+                icon.name: "help-about"
+
+                QQC2.ToolTip {
+                    visible: bluezPollingHelp.hovered
+                    text: i18n("Sets the interval for polling BlueZ for the battery updates of connected devices.")
+                }
+            }
+        }
+
+        Item {
+            Kirigami.FormData.isSection: true
             Kirigami.FormData.label: i18n("HID Devices Integration")
         }
 
@@ -157,6 +219,79 @@ KCMUtils.SimpleKCM {
                 QQC2.ToolTip {
                     visible: hidPollingHelp.hovered
                     text: i18n("Sets the interval for re-checking HID devices when none are connected.\nWhen a device is active, it updates automatically.")
+                }
+            }
+        }
+
+        Item {
+            Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: i18n("Solaar Integration")
+        }
+
+        QQL.RowLayout {
+            Kirigami.FormData.label: i18n("Enable")
+
+            QQC2.CheckBox {
+                id: enableSolaarIntegration
+            }
+        }
+
+        QQL.RowLayout {
+            Kirigami.FormData.label: i18n("Polling interval")
+
+            QQC2.SpinBox {
+                id: solaarPollingTime
+                enabled: enableSolaarIntegration.checked
+                from: 5
+                to: 3600
+            }
+
+            QQC2.Label {
+                text: i18n("s")
+                opacity: enableSolaarIntegration.checked ? 0.7 : 0.5
+            }
+
+            QQC2.ToolButton {
+                id: solaarPollingHelp
+                icon.name: "help-about"
+
+                QQC2.ToolTip {
+                    visible: solaarPollingHelp.hovered
+                    text: i18n("Sets the interval for Solaar device state updates.\nRequires Solaar to be installed; Logitech devices only.")
+                }
+            }
+        }
+
+        Item {
+            Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: i18n("HeadsetControl Integration")
+        }
+
+        QQL.RowLayout {
+            Kirigami.FormData.label: i18n("Enable")
+            QQC2.CheckBox {
+                id: enableHeadsetControlIntegration
+            }
+        }
+
+        QQL.RowLayout {
+            Kirigami.FormData.label: i18n("Polling interval")
+            QQC2.SpinBox {
+                id: headsetControlPollingTime
+                enabled: enableHeadsetControlIntegration.checked
+                from: 5
+                to: 3600
+            }
+            QQC2.Label {
+                text: i18n("s")
+                opacity: enableHeadsetControlIntegration.checked ? 0.7 : 0.5
+            }
+            QQC2.ToolButton {
+                id: headsetControlPollingHelp
+                icon.name: "help-about"
+                QQC2.ToolTip {
+                    visible: headsetControlPollingHelp.hovered
+                    text: i18n("Sets the interval for HeadsetControl battery updates.")
                 }
             }
         }
