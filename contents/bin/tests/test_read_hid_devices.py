@@ -1218,7 +1218,8 @@ def test_glorious_real_model_o_wireless_node_layout():
     devs = rhd.find_devices()
     assert len(devs) == 1, f"one entry for the mouse, got {devs!r}"
     assert devs[0].devpath == "/dev/hidraw2", f"best-ranked vendor node, got {devs[0].devpath}"
-    assert devs[0].serial == "000000000000", devs[0].serial
+    # all-zero HID_UNIQ is treated as absent, so the physical path identifies it
+    assert devs[0].serial == "usb-0000:02:00.0-1", devs[0].serial
     assert rhd.read_status(devs[0]) == {"percentage": 93, "charging": False}
 
 
