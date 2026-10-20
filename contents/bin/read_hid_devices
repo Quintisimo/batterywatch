@@ -794,22 +794,28 @@ def _hidiocgfeature(size):
 def read_feature_status(dev, schema):
     try:
         fd = os.open(dev.devpath, os.O_RDWR | os.O_NONBLOCK)
-    except OSError:
+    except OSError as e:
+        debug(f"{dev.desc.name}: open({dev.devpath}, O_RDWR) failed: {e}")
         return None
 
     buf = bytearray(len(schema.request))
     try:
+        debug(f"{dev.desc.name}: set feature {hexbuf(schema.request)} ({len(schema.request)} bytes)")
         fcntl.ioctl(fd, _hidiocsfeature(len(schema.request)), bytearray(schema.request))
         time.sleep(schema.settle)
         buf[0] = schema.request[0]
         fcntl.ioctl(fd, _hidiocgfeature(len(buf)), buf)
-    except OSError:
+    except OSError as e:
+        debug(f"{dev.desc.name}: feature report exchange on {dev.devpath} failed: {e}")
         return None
     finally:
         os.close(fd)
 
+    debug(f"{dev.desc.name}: received {hexbuf(buf)} ({len(buf)} bytes)")
     buffers = {buf[0]: bytes(buf)}
-    return dev.desc.parse(buffers) if dev.desc.parse is not None else interpret(schema, buffers)
+    result = dev.desc.parse(buffers) if dev.desc.parse is not None else interpret(schema, buffers)
+    debug(f"{dev.desc.name}: reading {result}")
+    return result
 
 # Runs a short ordered sequence of request/reply exchanges on one open node.
 # Every step must succeed before parse() sees any replies, so callers never get

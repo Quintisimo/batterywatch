@@ -1268,6 +1268,17 @@ def test_debug_output_records_open_and_write_failures():
         assert rhd.read_status(rhd.find_devices()[0]) is None
     assert "open(/dev/hidraw6, O_RDWR) failed: [Errno 13] Permission denied" in stderr.getvalue()
 
+def test_debug_output_explains_a_silent_glorious_mouse():
+    # an asleep mouse is dropped without a reading; the log shows why
+    install_glorious_scenario()
+    set_glorious_reply(pct=42, state=0xA4)
+    with debug_stderr() as stderr:
+        assert rhd.read_status(rhd.find_devices()[0]) is None
+    log = stderr.getvalue()
+    assert "set feature 00 00 00 02 02 00 83" in log, "request bytes"
+    assert "received 00 a4" in log, "reply bytes with the asleep link state"
+    assert "reading None" in log, log
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # Helper as a subprocess (real run, no device)
