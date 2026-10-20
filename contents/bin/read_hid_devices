@@ -791,6 +791,10 @@ def _hidiocgfeature(size):
 # Feature-report exchange: SET the request, pause, GET the reply on the same
 # report ID. For report ID 0 the kernel leaves byte 0 of the buffer alone and
 # fills from byte 1, which is the layout the vendor protocols document.
+# Unlike the poll-based readers there is no schema timeout: the ioctls block
+# until the kernel's own control-transfer timeout (seconds) if the device never
+# answers, and every read costs the fixed settle pause. Both match the
+# reference implementation, so the read is bounded but blocking.
 def read_feature_status(dev, schema):
     try:
         fd = os.open(dev.devpath, os.O_RDWR | os.O_NONBLOCK)
