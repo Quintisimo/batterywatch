@@ -23,14 +23,16 @@ import json
 import os
 import re
 import select
+import subprocess
 import sys
+import threading
 import time
 from enum import Enum
 from typing import NamedTuple, Callable
 
 TIMEOUT_SEC = 10
-MAX_DEVICES = 8
 HID_BUFFER_SIZE = 64
+FEATURE_TIMEOUT_SEC = 2
 
 # Diagnostic logging. With --debug, helper emits stderr lines (never interfering
 # with the JSON on stdout) so a found-but-silent device is visible instead of
@@ -151,6 +153,7 @@ class FeatureReportSchema(NamedTuple):
     status:       DataPos | ChargingStates | None
     request:      bytes                       # byte 0 = report ID, as hidraw expects
     settle:       float = 0.05                # pause before reading the reply back
+    timeout:      float = FEATURE_TIMEOUT_SEC # deadline for the isolated exchange
 
 # Both request-style schemas send a packet, so their node must be opened R/W
 def needs_write(schema):
@@ -182,7 +185,7 @@ def interpret(schema, buffers):
         span = hi - lo
         percentage = 0 if span <= 0 else max(0, min(100, round((raw - lo) * 100 / span)))
 
-    charging = False
+    charging = None
     st = schema.status
     if isinstance(st, DataPos):
         charging = bool(buffers[st.report_id][st.data_byte])
@@ -270,26 +273,30 @@ RAZER_BATTERY_REQUEST = _razer_get_request(0x21)
 RAZER_CHARGING_REQUEST = _razer_get_request(0x2A)
 
 # ── Glorious wireless mice ─────────────────────────────────────────────────
-# Protocol per the glorious-mouse reference implementation: SET a 65-byte
+# Protocol per https://github.com/louis4craft/glorious-ctl: SET a 65-byte
 # vendor feature report (byte 3 = 0x02 command class, byte 4 = 0x02 length,
 # byte 6 = 0x83 "read battery"), then GET the same report back. Report ID is
 # 0, which hidraw keeps in byte 0 of the buffer, so every offset below matches
 # the hidapi-based reference one-for-one.
 # The battery lives on the vendor collection; like the reference's interface
-# scoring, it is identified by report-descriptor usage page 0xff01 or 0xff00.
+# scoring, prefer 0xff01, then 0xff00, then other vendor usage pages.
 GLORIOUS_REQUEST = bytes.fromhex("00000002020083") + b"\x00" * 58
 
 # Reply: byte 1 = link state, byte 6 echoes 0x83, byte 8 = charge percent.
 # Only state 0xA1 is a live reading - 0xA4 (asleep) and 0xA0 (waking) carry no
 # usable value, so the device is simply omitted until it answers properly.
-# ponytail: the protocol exposes no charging bit (the reference infers it from
-# a user-supplied "wired" flag), so charging is always False. Upgrade path:
-# decode it here if a charge flag is ever found in the reply.
+# The protocol exposes no charging bit. A cable does not prove active charging,
+# so preserve unknown and let another provider supply a known state.
 def _glorious_parse(buffers):
     buf = buffers[0x00]
     if buf[6] != 0x83 or buf[1] != 0xA1:
         return None
-    return {"percentage": max(1, min(buf[8], 100)), "charging": False}
+    return {"percentage": max(1, min(buf[8], 100)), "charging": None}
+
+def _glorious_serial_resolver(path, vid, pid, fields):
+    return (meaningful_hid_uniq(usb_serial(path, vid, pid))
+            or meaningful_hid_uniq(fields.get("HID_UNIQ", ""))
+            or "unknown-hid")
 
 # vid, display name, PIDs (from the reference devices.json; wired-only models
 # have no battery and are left out)
@@ -317,6 +324,7 @@ def _glorious_mice():
                 request=GLORIOUS_REQUEST,
             ),
             parse=_glorious_parse,
+            serial_resolver=_glorious_serial_resolver,
         )
         for vid, name, pids in _GLORIOUS_MODELS
     ]
@@ -512,7 +520,7 @@ def usb_serial(path, vid, pid):
             if parent_vid == vid and parent_pid == pid:
                 with open(f"{current}/serial", "r") as file:
                     serial = printable_serial(file.read())
-                if serial:
+                if meaningful_hid_uniq(serial):
                     return serial
         except (OSError, ValueError):
             pass
@@ -592,8 +600,7 @@ def hid_usage_pages(path):
 
 # Reference implementations locate the battery collection by preferring usage
 # page 0xff01, then 0xff00, then any other vendor-defined page (0xff00-0xffff),
-# and among equals the highest interface number. Mirrors glorious-mouse's
-# interface scoring, which ranks rather than filters.
+# and among equals the highest interface number.
 def node_rank(usage_pages, iface):
     if 0xFF01 in usage_pages:
         score = 0
@@ -691,9 +698,8 @@ def udev_unblock_command(vid):
 def find_devices():
     # One entry per physical device: several of its hidraw nodes can match
     # (iface=None, or a family matched on the vendor page range), so keep the
-    # best-ranked node per device while preserving discovery order.
+    # best-ranked node per device, then sort by name and physical path.
     best = {}
-    order = []
     try:
         entries = os.listdir("/sys/class/hidraw")
     except OSError:
@@ -720,18 +726,16 @@ def find_devices():
             continue
         desc, variant = matched
 
-        serial = (desc.serial_resolver(f"/sys/class/hidraw/{name}/device/uevent", vid, pid, fields)
-                  if desc.serial_resolver is not None
-                  else meaningful_hid_uniq(fields.get("HID_UNIQ", "")) or "unknown-hid")
-
         # phys is shared across a device's interfaces, so it identifies the
         # physical device; the best-ranked of its matching nodes wins.
         key = (desc.name, phys or name)
         rank = node_rank(usage_pages, iface)
-        if key not in best:
-            order.append(key)
-        elif rank >= best[key][0]:
+        if key in best and rank >= best[key][0]:
             continue
+
+        serial = (desc.serial_resolver(f"/sys/class/hidraw/{name}/device/uevent", vid, pid, fields)
+                  if desc.serial_resolver is not None
+                  else meaningful_hid_uniq(fields.get("HID_UNIQ", "")) or "unknown-hid")
 
         # Fall back to the physical path when the device reports no serial, so
         # multiple identical dongles get distinct ids.
@@ -742,7 +746,7 @@ def find_devices():
         debug(f"{devpath}: reading {desc.name} {vid:04x}:{pid:04x} "
               f"(iface {iface}, usage pages {[hex(p) for p in sorted(usage_pages)] or 'not read'})")
         best[key] = (rank, FoundDevice(devpath, serial, desc, pid, variant.source or desc.source))
-    return [best[key][1] for key in order[:MAX_DEVICES]]
+    return [best[key][1] for key in sorted(best)]
 
 # True when the device is present but its hidraw node can't be opened for the
 # access level the schema needs (missing udev rule). Asleep devices *can* be
@@ -769,7 +773,7 @@ def open_device(dev, schema):
               f"{'O_RDWR' if write else 'O_RDONLY'}) failed: {e}")
         return None
 
-    if write and not schema.transactions:
+    if isinstance(schema, RequestSchema) and not schema.transactions:
         try:
             debug(f"{dev.desc.name}: write {hexbuf(schema.request)} ({len(schema.request)} bytes)")
             os.write(fd, schema.request)
@@ -787,34 +791,57 @@ def _hidiocsfeature(size):
 def _hidiocgfeature(size):
     return (3 << 30) | (size << 16) | (ord('H') << 8) | 0x07
 
-# Feature-report exchange: SET the request, pause, GET the reply on the same
-# report ID. For report ID 0 the kernel leaves byte 0 of the buffer alone and
-# fills from byte 1, which is the layout the vendor protocols document.
-# Unlike the poll-based readers there is no schema timeout: the ioctls block
-# until the kernel's own control-transfer timeout (seconds) if the device never
-# answers, and every read costs the fixed settle pause. Both match the
-# reference implementation, so the read is bounded but blocking.
-def read_feature_status(dev, schema):
+# Runs only in the feature worker. It owns the descriptor through both ioctls.
+def _read_feature_report(devpath, request, settle):
+    fd = os.open(devpath, os.O_RDWR | os.O_NONBLOCK)
     try:
-        fd = os.open(dev.devpath, os.O_RDWR | os.O_NONBLOCK)
-    except OSError as e:
-        debug(f"{dev.desc.name}: open({dev.devpath}, O_RDWR) failed: {e}")
-        return None
-
-    buf = bytearray(len(schema.request))
-    try:
-        debug(f"{dev.desc.name}: set feature {hexbuf(schema.request)} ({len(schema.request)} bytes)")
-        fcntl.ioctl(fd, _hidiocsfeature(len(schema.request)), bytearray(schema.request))
-        time.sleep(schema.settle)
-        buf[0] = schema.request[0]
-        fcntl.ioctl(fd, _hidiocgfeature(len(buf)), buf)
-    except OSError as e:
-        debug(f"{dev.desc.name}: feature report exchange on {dev.devpath} failed: {e}")
-        return None
+        sent = fcntl.ioctl(fd, _hidiocsfeature(len(request)), bytearray(request))
+        if sent != len(request):
+            raise OSError(f"short feature request: sent {sent} of {len(request)} bytes")
+        time.sleep(settle)
+        buf = bytearray(len(request))
+        buf[0] = request[0]
+        received = fcntl.ioctl(fd, _hidiocgfeature(len(buf)), buf)
+        return bytes(buf[:received])
     finally:
         os.close(fd)
 
+# O_NONBLOCK does not bound USB control ioctls. A separate process with private
+# pipes lets the helper emit JSON and exit on time even if a killed worker is
+# still waiting for the kernel's control-transfer timeout. Reap it off-thread;
+# never wait for that kernel operation on the main reader's timeout path.
+def _feature_exchange(devpath, schema):
+    process = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--feature-report",
+         devpath, schema.request.hex(), str(schema.settle)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        buf, error = process.communicate(timeout=schema.timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        threading.Thread(target=process.communicate, daemon=True).start()
+        raise
+    if process.returncode:
+        raise OSError(error.decode(errors="replace").strip())
+    return buf
+
+def read_feature_status(dev, schema):
+    debug(f"{dev.desc.name}: set feature {hexbuf(schema.request)} ({len(schema.request)} bytes)")
+    try:
+        buf = _feature_exchange(dev.devpath, schema)
+    except subprocess.TimeoutExpired:
+        debug(f"{dev.desc.name}: feature report timed out after {schema.timeout:g}s ({dev.devpath})")
+        return None
+    except OSError as e:
+        debug(f"{dev.desc.name}: feature report exchange on {dev.devpath} failed: {e}")
+        return None
+
     debug(f"{dev.desc.name}: received {hexbuf(buf)} ({len(buf)} bytes)")
+    needed = needed_reports(schema)
+    if not buf or buf[0] != schema.request[0] or len(buf) < needed.get(buf[0], len(schema.request)):
+        debug(f"{dev.desc.name}: feature reply is too short or has the wrong report id")
+        return None
     buffers = {buf[0]: bytes(buf)}
     result = dev.desc.parse(buffers) if dev.desc.parse is not None else interpret(schema, buffers)
     debug(f"{dev.desc.name}: reading {result}")
@@ -1000,7 +1027,7 @@ def read_status(dev):
 _SIMULATE_DEVICES = [
     ("Keychron M5", "sim-keychron-m5", 0x3434, "d028", "mouse", 88, False),
     ("Steam Controller 2", "sim-steam-controller-2", 0x28DE, "1304", "gamepad", 85, True),
-    ("Glorious Model O Wireless", "sim-glorious-model-o", 0x258A, "2022", "mouse", 42, False),
+    ("Glorious Model O Wireless", "sim-glorious-model-o", 0x258A, "2022", "mouse", 42, None),
 ]
 
 def _simulate():
@@ -1038,6 +1065,14 @@ def _device_entry(dev):
     return None
 
 def main():
+    if len(sys.argv) == 5 and sys.argv[1] == "--feature-report":
+        try:
+            buf = _read_feature_report(sys.argv[2], bytes.fromhex(sys.argv[3]), float(sys.argv[4]))
+        except OSError as e:
+            print(e, file=sys.stderr)
+            sys.exit(1)
+        sys.stdout.buffer.write(buf)
+        return
     if _DEBUG:
         # Strip the flag so the logic below sees the same argv as without it.
         sys.argv.pop(sys.argv.index("--debug"))

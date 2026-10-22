@@ -36,9 +36,6 @@
 | **Solaar** (experimental) | Logitech HID++ peripherals via [Solaar](https://github.com/pwr-Solaar/Solaar) - only tested on a few devices, so feedback is welcome |
 | **HeadsetControl** | Compatible wireless headsets supported by [HeadsetControl](https://github.com/Sapd/HeadsetControl), with battery levels obtained through its command-line JSON output. Requires HeadsetControl to be installed and the headset to be supported by it. |
 
-> **Note:** The Glorious mouse protocol (vendor feature report `02 02 ... 83`, PID list) is taken from the `glorious-mouse` reference implementation; it reports charge level only, so Glorious mice are never shown as charging. Tested on a Model O Wireless.
-
-
 ## Installation
 
 ### From the KDE Store (Recommended)

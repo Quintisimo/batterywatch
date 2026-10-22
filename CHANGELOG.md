@@ -5,7 +5,7 @@
 ### Added
 - **BlueZ integration** — battery percentage of connected Bluetooth devices that report battery to BlueZ but not to UPower (e.g. 8bitdo controllers), read through `bluetoothctl` with a configurable polling interval (default 5s) and a disconnect action. Charging is reported as unknown rather than "not charging", so a provider that knows the state fills it in (contributed by @birrkan)
 - **Low-battery notifications** — enable alerts, and set a battery threshold; use the popup's bell toggle to mute individual devices. BatteryWatch sends one system notification when a monitored battery is at or below the threshold and not charging; it can alert again after the battery rises above the threshold and later drops low again. Muted devices are saved across restarts (contributed by @YourM4jesty, issue #60)
-- **Glorious wireless mouse support** — battery level of the Glorious Model O/O 2/O3, Model D/D-/D 2 PRO and Model I 2 wireless mice, read over the vendor HID feature report (`02 02 … 83`) on the mouse's vendor collection. The protocol carries no charging bit, so these mice always report as discharging — including while plugged in over USB and charging (e.g. the wired Model D 2 PRO, `201a`)
+- **Glorious wireless mouse support** — battery level of the Glorious Model O/O 2/O3, Model D/D-/D 2 PRO and Model I 2 wireless mice, read over HID feature reports. Tested on a Model O Wireless. The protocol provides no charging state, including over USB, so charging remains unknown unless another provider supplies it. Feature-report exchanges have a two-second deadline so an unresponsive mouse does not delay other HID readings (contributed by @Quintisimo, PR #46)
 
 ### Changed
 - **Providers fill each other's gaps** — a device reported by two providers is one entry: the higher-priority reading stays, and the later provider fills what it left missing — a percentage it does not have, or the charging state it cannot know. A permission-blocked entry is replaced as soon as another provider reads the device
@@ -16,6 +16,7 @@
 - @birrkan — BlueZ integration (initial BluezQt implementation, reworked to bluetoothctl during review)
 - @CorneliusKluge — issue #2: tireless on-device testing across many builds, from the first hidraw diagnostics to confirming the Flatpak discovery on his Flathub setup; his detailed reports and patience shaped this whole integration — thank you!
 - @YourM4jesty — low-battery notifications (threshold setting, per-device toggle, and muted devices list persistence)
+- @Quintisimo — Glorious wireless mouse support, with protocol implementation and testing on a Model O Wireless (PR #46)
 
 ## [0.3.2] - 2026-10-05
 
