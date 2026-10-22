@@ -573,15 +573,31 @@ def _udev_mode_for(vid):
             return "0660" if isinstance(dev.source, RequestSchema) else "0440"
     return "0660"
 
+# A variant bound to an interface grants access to that interface only
+def _udev_interface_match(variant):
+    if variant.iface is None:
+        return ""
+    return f'ENV{{ID_USB_INTERFACE_NUM}}=="{variant.iface:02d}", '
+
+# systemd before v258 does not import usb_id for hidraw nodes, which is what
+# sets ID_USB_INTERFACE_NUM, so the rule file imports it when a line needs it
+def _udev_usb_id_import(vid):
+    return (f'SUBSYSTEM=="hidraw", ATTRS{{idVendor}}=="{vid:04x}", '
+            f'ENV{{ID_USB_INTERFACE_NUM}}=="", IMPORT{{builtin}}="usb_id"')
+
 # One udev rule line per connection variant of the device
 def udev_rule_for(vid):
+    variants = [variant for dev in KNOWN_DEVICES if dev.vid == vid
+                for variant in dev.variants]
     lines = [
         f'SUBSYSTEM=="hidraw", ATTRS{{idVendor}}=="{vid:04x}", '
         f'ATTRS{{idProduct}}=="{variant.pid:04x}", '
+        f'{_udev_interface_match(variant)}'
         f'MODE="{_udev_mode_for(vid)}", TAG+="uaccess", TAG+="udev-acl"'
-        for dev in KNOWN_DEVICES if dev.vid == vid
-        for variant in dev.variants
+        for variant in variants
     ]
+    if any(variant.iface is not None for variant in variants):
+        lines.insert(0, _udev_usb_id_import(vid))
     if lines:
         return "\n".join(lines)
     # Unknown device: a vid-wide rule still helps the owner track it down
@@ -602,7 +618,7 @@ def udev_unblock_command(vid):
         f"sudo sh -c 'tee {path} >/dev/null <<EOF\n"
         f"{body}\n"
         f"EOF'\n"
-        f"sudo udevadm control --reload-rules && sudo udevadm trigger"
+        f"sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=hidraw"
     )
 
 # Goes through /sys/class/hidraw* and collects all known interfaces

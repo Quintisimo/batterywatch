@@ -874,6 +874,44 @@ def test_udev_unblock_command_contains_rule_and_reload():
     assert "udevadm control --reload-rules" in cmd
     assert "udevadm trigger" in cmd
 
+def test_udev_rule_matches_each_variant_interface():
+    lines = rhd.udev_rule_for(0x0B05).split("\n")
+    by_pid = {pid: [line for line in lines if f'ATTRS{{idProduct}}=="{pid}"' in line]
+              for pid in ("1a83", "1a85", "1ace")}
+    assert all(len(found) == 1 for found in by_pid.values()), by_pid
+    assert 'ENV{ID_USB_INTERFACE_NUM}=="01"' in by_pid["1a83"][0]
+    assert 'ENV{ID_USB_INTERFACE_NUM}=="01"' in by_pid["1a85"][0]
+    assert 'ENV{ID_USB_INTERFACE_NUM}=="02"' in by_pid["1ace"][0]
+    assert rhd.udev_rule_for(0x3434).count('ENV{ID_USB_INTERFACE_NUM}=="04"') == 2
+    sc2 = rhd.udev_rule_for(0x28DE)
+    assert 'ATTRS{idProduct}=="1302", ENV{ID_USB_INTERFACE_NUM}=="00"' in sc2
+    assert 'ATTRS{idProduct}=="1304", ENV{ID_USB_INTERFACE_NUM}=="02"' in sc2
+
+def test_udev_rule_imports_usb_id_before_matching_the_interface():
+    # systemd before v258 does not import usb_id for hidraw nodes, so the
+    # interface number would be missing without this line
+    lines = rhd.udev_rule_for(0x3434).split("\n")
+    assert lines[0] == ('SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3434", '
+                        'ENV{ID_USB_INTERFACE_NUM}=="", IMPORT{builtin}="usb_id"')
+    assert all('ENV{ID_USB_INTERFACE_NUM}=="04"' in line for line in lines[1:])
+
+def test_udev_rule_without_interface_has_no_interface_match():
+    rule = rhd.udev_rule_for(0x1532)
+    assert "ID_USB_INTERFACE_NUM" not in rule
+    assert "IMPORT" not in rule
+    assert 'ATTRS{idProduct}=="0574"' in rule
+
+def test_udev_rule_for_unknown_vendor_stays_vendor_wide():
+    assert rhd.udev_rule_for(0xABCD) == (
+        'SUBSYSTEM=="hidraw", ATTRS{idVendor}=="abcd", '
+        'MODE="0660", TAG+="uaccess", TAG+="udev-acl"'
+    )
+
+def test_udev_unblock_command_triggers_only_hidraw_devices():
+    cmd = rhd.udev_unblock_command(0x3434)
+    assert cmd.endswith("sudo udevadm control --reload-rules && "
+                        "sudo udevadm trigger --subsystem-match=hidraw"), cmd
+
 def test_udev_unblock_command_is_readable_heredoc():
     # Wrapped in `sudo sh -c '...'` so the same heredoc pastes in sh/bash/zsh/fish
     cmd = rhd.udev_unblock_command(0x3434)
